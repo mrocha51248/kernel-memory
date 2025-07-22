@@ -28,8 +28,6 @@ public sealed class PostgresMemory : IMemoryDb, IDisposable, IAsyncDisposable
     private readonly ITextEmbeddingGenerator _embeddingGenerator;
     private readonly ILogger<PostgresMemory> _log;
 
-    private readonly bool _useHybridSearch;
-
     /// <summary>
     /// Create a new instance of Postgres KM connector
     /// </summary>
@@ -42,7 +40,6 @@ public sealed class PostgresMemory : IMemoryDb, IDisposable, IAsyncDisposable
         ILoggerFactory? loggerFactory = null)
     {
         this._log = (loggerFactory ?? DefaultLogger.Factory).CreateLogger<PostgresMemory>();
-        this._useHybridSearch = config.UseHybridSearch;
 
         this._embeddingGenerator = embeddingGenerator;
         if (this._embeddingGenerator == null)
@@ -54,6 +51,28 @@ public sealed class PostgresMemory : IMemoryDb, IDisposable, IAsyncDisposable
         config.TableNamePrefix = NormalizeTableNamePrefix(config.TableNamePrefix);
 
         this._db = new PostgresDbClient(config, loggerFactory);
+    }
+
+    public async Task MigrateIndexAsync(
+        string index,
+        CancellationToken cancellationToken = default)
+    {
+        index = NormalizeIndexName(index);
+
+        try
+        {
+            if (!await this._db.DoesTableExistAsync(index, cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            await this._db.MigrateTableAsync(index, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            this._log.LogError(e, "DB error while attempting to migrate index");
+            throw new PostgresException("DB error while attempting to migrate index", e);
+        }
     }
 
     /// <inheritdoc />
@@ -148,6 +167,43 @@ public sealed class PostgresMemory : IMemoryDb, IDisposable, IAsyncDisposable
     public async IAsyncEnumerable<(MemoryRecord, double)> GetSimilarListAsync(
         string index,
         string text,
+        Vector vector,
+        ICollection<MemoryFilter>? filters = null,
+        double minRelevance = 0,
+        int limit = 1,
+        bool withEmbeddings = false,
+        bool useHybridSearch = true,
+        bool useBm25Search = false,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        index = NormalizeIndexName(index);
+
+        var (sql, unsafeSqlUserValues) = this.PrepareSql(filters);
+
+
+        var records = this._db.GetSimilarAsync(
+            index,
+            query: text,
+            target: vector,
+            minSimilarity: minRelevance,
+            filterSql: sql,
+            sqlUserValues: unsafeSqlUserValues,
+            limit: limit,
+            withEmbeddings: withEmbeddings,
+            useHybridSearch: useHybridSearch,
+            useBm25Search: useBm25Search,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        await foreach ((PostgresMemoryRecord record, double similarity) result in records)
+        {
+            yield return (PostgresMemoryRecord.ToMemoryRecord(result.record), result.similarity);
+        }
+    }
+
+    /// <inheritdoc />
+    public async IAsyncEnumerable<(MemoryRecord, double)> GetSimilarListAsync(
+        string index,
+        string text,
         ICollection<MemoryFilter>? filters = null,
         double minRelevance = 0,
         int limit = 1,
@@ -169,7 +225,7 @@ public sealed class PostgresMemory : IMemoryDb, IDisposable, IAsyncDisposable
             sqlUserValues: unsafeSqlUserValues,
             limit: limit,
             withEmbeddings: withEmbeddings,
-            useHybridSearch: this._useHybridSearch,
+            useHybridSearch: true,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         await foreach ((PostgresMemoryRecord record, double similarity) result in records)

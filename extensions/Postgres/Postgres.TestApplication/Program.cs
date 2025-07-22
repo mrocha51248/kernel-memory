@@ -1,7 +1,6 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using Microsoft.KernelMemory;
-using Microsoft.KernelMemory.AI.Ollama;
 using Microsoft.KernelMemory.DocumentStorage.DevTools;
 using Microsoft.KernelMemory.FileSystem.DevTools;
 
@@ -27,13 +26,16 @@ internal static class Program
         var postgresConfig = cfg.GetSection("KernelMemory:Services:Postgres").Get<PostgresConfig>();
         ArgumentNullExceptionEx.ThrowIfNull(postgresConfig, nameof(postgresConfig), "Postgres config not found");
 
-        var ollamaConfig = cfg.GetSection("KernelMemory:Services:Ollama").Get<OllamaConfig>();
-        ArgumentNullExceptionEx.ThrowIfNull(ollamaConfig, nameof(ollamaConfig), "Ollama config not found");
+        var azureOpenAIEmbeddingConfig = cfg.GetSection("KernelMemory:Services:AzureOpenAIEmbedding").Get<AzureOpenAIConfig>();
+        ArgumentNullExceptionEx.ThrowIfNull(azureOpenAIEmbeddingConfig, nameof(azureOpenAIEmbeddingConfig), "AzureOpenAIEmbedding config not found");
+
+        var azureOpenAITextConfig = cfg.GetSection("KernelMemory:Services:AzureOpenAIText").Get<AzureOpenAIConfig>();
+        ArgumentNullExceptionEx.ThrowIfNull(azureOpenAITextConfig, nameof(azureOpenAITextConfig), "AzureOpenAIText config not found");
 
         // Concatenate our 'WithPostgresMemoryDb()' after 'WithOpenAIDefaults()' from the core nuget
         var mem1 = new KernelMemoryBuilder()
-            .WithOllamaTextEmbeddingGeneration(ollamaConfig)
-            .WithOllamaTextGeneration(ollamaConfig)
+            .WithAzureOpenAITextGeneration(azureOpenAITextConfig)
+            .WithAzureOpenAITextEmbeddingGeneration(azureOpenAIEmbeddingConfig)
             .WithPostgresMemoryDb(postgresConfig)
             .WithSimpleFileStorage(SimpleFileStorageConfig.Persistent)
             .Build();
@@ -42,16 +44,16 @@ internal static class Program
         var mem2 = new KernelMemoryBuilder()
             .WithPostgresMemoryDb(postgresConfig)
             .WithSimpleFileStorage(SimpleFileStorageConfig.Persistent)
-            .WithOllamaTextEmbeddingGeneration(ollamaConfig)
-            .WithOllamaTextGeneration(ollamaConfig)
+            .WithAzureOpenAITextGeneration(azureOpenAITextConfig)
+            .WithAzureOpenAITextEmbeddingGeneration(azureOpenAIEmbeddingConfig)
             .Build();
 
         // Concatenate our 'WithPostgresMemoryDb()' before and after KM builder extension methods from the core nuget
         var mem3 = new KernelMemoryBuilder()
             .WithSimpleFileStorage(SimpleFileStorageConfig.Persistent)
-            .WithOllamaTextEmbeddingGeneration(ollamaConfig)
-            .WithOllamaTextGeneration(ollamaConfig)
+            .WithAzureOpenAITextGeneration(azureOpenAITextConfig)
             .WithPostgresMemoryDb(postgresConfig)
+            .WithAzureOpenAITextEmbeddingGeneration(azureOpenAIEmbeddingConfig)
             .Build();
 
         await mem1.DeleteIndexAsync("index1");
@@ -90,7 +92,8 @@ internal static class Program
     private static async Task Test2()
     {
         var postgresConfig = new PostgresConfig();
-        var ollamaConfig = new OllamaConfig();
+        var azureOpenAIEmbeddingConfig = new AzureOpenAIConfig();
+        var azureOpenAITextConfig = new AzureOpenAIConfig();
 
         new ConfigurationBuilder()
             .AddJsonFile("appsettings.json")
@@ -98,12 +101,13 @@ internal static class Program
             .AddJsonFile("appsettings.Development.json", optional: true)
             .Build()
             .BindSection("KernelMemory:Services:Postgres", postgresConfig)
-            .BindSection("KernelMemory:Services:Ollama", ollamaConfig);
+            .BindSection("KernelMemory:Services:AzureOpenAIEmbedding", azureOpenAIEmbeddingConfig)
+            .BindSection("KernelMemory:Services:AzureOpenAIText", azureOpenAITextConfig);
 
         var memory = new KernelMemoryBuilder()
             .WithPostgresMemoryDb(postgresConfig)
-            .WithOllamaTextGeneration(ollamaConfig)
-            .WithOllamaTextEmbeddingGeneration(ollamaConfig)
+            .WithAzureOpenAITextGeneration(azureOpenAITextConfig)
+            .WithAzureOpenAITextEmbeddingGeneration(azureOpenAIEmbeddingConfig)
             .WithSimpleFileStorage(new SimpleFileStorageConfig
             {
                 StorageType = FileSystemTypes.Disk,
@@ -136,7 +140,8 @@ internal static class Program
     private static async Task Test3()
     {
         var postgresConfig = new PostgresConfig();
-        var ollamaConfig = new OllamaConfig();
+        var azureOpenAIEmbeddingConfig = new AzureOpenAIConfig();
+        var azureOpenAITextConfig = new AzureOpenAIConfig();
 
         // Note: using appsettings.custom-sql.json
         new ConfigurationBuilder()
@@ -146,12 +151,13 @@ internal static class Program
             .AddJsonFile("appsettings.custom-sql.json")
             .Build()
             .BindSection("KernelMemory:Services:Postgres", postgresConfig)
-            .BindSection("KernelMemory:Services:Ollama", ollamaConfig);
+            .BindSection("KernelMemory:Services:AzureOpenAIEmbedding", azureOpenAIEmbeddingConfig)
+            .BindSection("KernelMemory:Services:AzureOpenAIText", azureOpenAITextConfig);
 
         var memory = new KernelMemoryBuilder()
             .WithPostgresMemoryDb(postgresConfig)
-            .WithOllamaTextGeneration(ollamaConfig)
-            .WithOllamaTextEmbeddingGeneration(ollamaConfig)
+            .WithAzureOpenAITextGeneration(azureOpenAITextConfig)
+            .WithAzureOpenAITextEmbeddingGeneration(azureOpenAIEmbeddingConfig)
             .WithSimpleFileStorage(new SimpleFileStorageConfig
             {
                 StorageType = FileSystemTypes.Disk,

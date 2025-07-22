@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -42,7 +43,6 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
         this._dbNamePresent = config.ConnectionString.Contains("Database=", StringComparison.OrdinalIgnoreCase);
         this._schema = config.Schema;
         this._tableNamePrefix = config.TableNamePrefix;
-        this._textSearchLanguage = config.TextSearchLanguage;
         this._rrfK = config.RRFK;
 
         this._colId = config.Columns[PostgresConfig.ColumnId];
@@ -59,16 +59,8 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
         PostgresSchema.ValidateFieldName(this._colContent);
         PostgresSchema.ValidateFieldName(this._colPayload);
 
-        this._columnsListNoEmbeddings = $"{this._colId},{this._colTags},{this._colContent},{this._colPayload}";
-        this._columnsListWithEmbeddings = $"{this._colId},{this._colTags},{this._colContent},{this._colPayload},{this._colEmbedding}";
-        this._columnsListHybrid = $"{this._colId},{this._colTags},{this._colContent},{this._colPayload},{this._colEmbedding}";
-        this._columnsListHybridCoalesce = $@"
-                                            COALESCE(semantic_search.{this._colId}, keyword_search.{this._colId}) AS {this._colId},
-                                            COALESCE(semantic_search.{this._colTags}, keyword_search.{this._colTags}) AS {this._colTags},
-                                            COALESCE(semantic_search.{this._colContent}, keyword_search.{this._colContent}) AS {this._colContent},
-                                            COALESCE(semantic_search.{this._colPayload}, keyword_search.{this._colPayload}) AS {this._colPayload},
-                                            COALESCE(semantic_search.{this._colEmbedding}, keyword_search.{this._colEmbedding}) AS {this._colEmbedding}
-                                         ";
+        this._columnsListNoEmbeddings = [this._colId, this._colTags, this._colContent, this._colPayload];
+        this._columnsListWithEmbeddings = [.. this._columnsListNoEmbeddings, this._colEmbedding];
 
         this._createTableSql = string.Empty;
         if (config.CreateTableSql?.Count > 0)
@@ -136,6 +128,87 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
         }
     }
 
+    public async Task MigrateTableAsync(
+        string tableName,
+        CancellationToken cancellationToken = default)
+    {
+        var tableNameWithoutSchema = this.WithTableNamePrefix(tableName);
+        tableName = this.WithSchemaAndTableNamePrefix(tableName);
+        this._log.LogTrace("Migrating table: {0}", tableName);
+
+        Npgsql.PostgresException? migrateErr = null;
+
+        NpgsqlConnection connection = await this.ConnectAsync(cancellationToken).ConfigureAwait(false);
+        await using (connection)
+        {
+            try
+            {
+                NpgsqlCommand cmd = connection.CreateCommand();
+                await using (cmd.ConfigureAwait(false))
+                {
+                    var lockId = GenLockId(tableName);
+
+                    cmd.CommandTimeout = 60000;
+
+#pragma warning disable CA2100 // SQL reviewed
+                    cmd.CommandText = $@"
+                        DO $$
+                        BEGIN
+                            -- Check if column exists
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM   information_schema.columns
+                                WHERE  table_schema = '{this._schema}'
+                                    AND  table_name   = '{tableNameWithoutSchema}'
+                                    AND  column_name  = 'bm25'
+                            ) THEN
+
+                                ALTER TABLE {tableName} ADD COLUMN bm25 bm25vector;
+                                CREATE INDEX IF NOT EXISTS ""{tableNameWithoutSchema}_bm25_idx"" ON {tableName} USING bm25 (bm25 bm25_ops);
+    
+                                UPDATE {tableName} SET bm25 = tokenize(content, 'km');
+    
+                                ALTER TABLE {tableName} ALTER COLUMN bm25 SET NOT NULL;
+
+                            END IF;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                    ";
+#pragma warning restore CA2100
+
+                    this._log.LogTrace("Migrating table with default SQL: {0}", cmd.CommandText);
+
+                    int result = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    this._log.LogTrace("Table '{0}' migration result: {1}", tableName, result);
+                }
+            }
+            catch (Npgsql.PostgresException e) when (IsVectorTypeDoesNotExistException(e))
+            {
+                this._log.LogError(e, "Vector type not installed, check 'SELECT * FROM pg_extension'");
+                throw;
+            }
+            catch (Npgsql.PostgresException e) when (e.SqlState == PgErrUniqueViolation)
+            {
+                migrateErr = e;
+            }
+            catch (Exception e)
+            {
+                this._log.LogError(e, "Table '{0}' migration error: {1}. Err: {2}. InnerEx: {3}", tableName, e, e.Message, e.InnerException);
+                throw;
+            }
+            finally
+            {
+                await connection.CloseAsync().ConfigureAwait(false);
+            }
+        }
+
+        if (migrateErr != null)
+        {
+            this._log.LogError(migrateErr, "Table migration failed: {0}", tableName);
+            throw migrateErr;
+        }
+    }
+
     /// <summary>
     /// Create a table.
     /// </summary>
@@ -148,8 +221,6 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var origInputTableName = tableName;
-        var indexTags = this.WithTableNamePrefix(tableName) + "_idx_tags";
-        var indexContent = this.WithTableNamePrefix(tableName) + "_idx_content";
         tableName = this.WithSchemaAndTableNamePrefix(tableName);
         this._log.LogTrace("Creating table: {0}", tableName);
 
@@ -187,8 +258,7 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
                                 {this._colContent}   TEXT DEFAULT '' NOT NULL,
                                 {this._colPayload}   JSONB DEFAULT '{{}}'::JSONB NOT NULL
                             );
-                            CREATE INDEX IF NOT EXISTS ""{indexTags}"" ON {tableName} USING GIN({this._colTags});
-                            CREATE INDEX IF NOT EXISTS ""{indexContent}"" ON {tableName} USING GIN(to_tsvector('{this._textSearchLanguage}',{this._colContent}));
+                            CREATE INDEX IF NOT EXISTS idx_tags ON {tableName} USING GIN({this._colTags});
                             COMMIT;
                         ";
 #pragma warning restore CA2100
@@ -248,6 +318,8 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
                 throw createErr;
             }
         }
+
+        await this.MigrateTableAsync(origInputTableName, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -359,15 +431,16 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
 #pragma warning disable CA2100 // SQL reviewed
                     cmd.CommandText = $@"
                         INSERT INTO {tableName}
-                            ({this._colId}, {this._colEmbedding}, {this._colTags}, {this._colContent}, {this._colPayload})
+                            ({this._colId}, {this._colEmbedding}, {this._colTags}, {this._colContent}, {this._colPayload}, bm25)
                             VALUES
-                            (@id, @embedding, @tags, @content, @payload)
+                            (@id, @embedding, @tags, @content, @payload, tokenize(@content, 'km'))
                         ON CONFLICT ({this._colId})
                         DO UPDATE SET
                             {this._colEmbedding} = @embedding,
                             {this._colTags}      = @tags,
                             {this._colContent}   = @content,
-                            {this._colPayload}   = @payload
+                            {this._colPayload}   = @payload,
+                            bm25                 = tokenize(@content, 'km')
                     ";
 
                     cmd.Parameters.AddWithValue("@id", record.Id);
@@ -410,6 +483,7 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
     /// <param name="offset">Records to skip from the top</param>
     /// <param name="withEmbeddings">Whether to include embedding vectors</param>
     /// <param name="useHybridSearch">Whether to use hybrid search or vector search</param>
+    /// <param name="useBm25Search">Whether to use bm25 search or vector search</param>
     /// <param name="cancellationToken">Async task cancellation token</param>
     public async IAsyncEnumerable<(PostgresMemoryRecord record, double similarity)> GetSimilarAsync(
         string tableName,
@@ -422,27 +496,23 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
         int offset = 0,
         bool withEmbeddings = false,
         bool useHybridSearch = false,
+        bool useBm25Search = false,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        var tableNameWithoutSchema = this.WithTableNamePrefix(tableName);
         tableName = this.WithSchemaAndTableNamePrefix(tableName);
 
         if (limit <= 0) { limit = int.MaxValue; }
 
         // Column names
-        string columns = withEmbeddings ? this._columnsListWithEmbeddings : this._columnsListNoEmbeddings;
+        var columns = withEmbeddings ? this._columnsListWithEmbeddings : this._columnsListNoEmbeddings;
 
-        // Filtering logic, including filter by similarity
-        //
+        // Filtering logic
         filterSql = filterSql?.Trim().Replace(PostgresSchema.PlaceholdersTags, this._colTags, StringComparison.Ordinal);
 
-        string filterSqlHybridText = string.IsNullOrWhiteSpace(filterSql) ? "TRUE" : filterSql;
+        filterSql = string.IsNullOrWhiteSpace(filterSql) ? "TRUE" : $"({filterSql})";
 
         var maxDistance = 1 - minSimilarity;
-        var distanceFilter = $"{this._colEmbedding} <=> @embedding < @maxDistance";
-
-        filterSql = string.IsNullOrWhiteSpace(filterSql) ?
-            distanceFilter :
-            $"({filterSql}) AND {distanceFilter}";
 
         if (sqlUserValues == null) { sqlUserValues = []; }
 
@@ -465,41 +535,50 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
                         // When using 1 - (embedding <=> target) the index is not being used, therefore we calculate
                         // the similarity (1 - distance) later. Furthermore, colDistance can't be used in the WHERE clause.
                         cmd.CommandText = @$"
-                        WITH semantic_search AS (
-                            SELECT {this._columnsListHybrid}, RANK () OVER (ORDER BY {this._colEmbedding} <=> @embedding) AS rank
+                            WITH semantic_search AS (
+                                SELECT {string.Join(',', columns)}, RANK () OVER (ORDER BY {this._colEmbedding} <=> @embedding) AS rank
+                                FROM {tableName}
+                                WHERE {filterSql} AND {this._colEmbedding} <=> @embedding < @maxDistance
+                                ORDER BY rank ASC
+                                LIMIT @limit
+                            ),
+                            keyword_search AS (
+                                SELECT {string.Join(',', columns)}, RANK () OVER (ORDER BY bm25 <&> to_bm25query('{tableNameWithoutSchema}_bm25_idx', tokenize(@query, 'km'))) as rank
+                                FROM {tableName}
+                                WHERE {filterSql}
+                                ORDER BY rank ASC
+                                LIMIT @limit
+                            )
+                            SELECT
+                                {string.Join(',', columns.Select(x => $"COALESCE(semantic_search.{x}, keyword_search.{x}) AS {x}"))},
+                                COALESCE(1.0 / ({this._rrfK} + semantic_search.rank), 0.0) +
+                                COALESCE(1.0 / ({this._rrfK} + keyword_search.rank), 0.0) AS {colDistance}
+                            FROM semantic_search
+                            FULL OUTER JOIN keyword_search ON semantic_search.{this._colId} = keyword_search.{this._colId}
+                            ORDER BY {colDistance} DESC
+                            LIMIT @limit
+                            OFFSET @offset
+                        ";
+                    }
+                    else if (useBm25Search)
+                    {
+                        cmd.CommandText = @$"
+                            SELECT {string.Join(',', columns)}, bm25 <&> to_bm25query('{tableNameWithoutSchema}_bm25_idx', tokenize(@query, 'km')) AS {colDistance}
                             FROM {tableName}
-                            WHERE {filterSql}
-                            ORDER BY {this._colEmbedding} <=> @embedding
+                            WHERE {filterSql} AND bm25 <&> to_bm25query('{tableNameWithoutSchema}_bm25_idx', tokenize(@query, 'km')) < @maxDistance
+                            ORDER BY {colDistance} ASC
                             LIMIT @limit
-                        ),
-                        keyword_search AS (
-                            SELECT {this._columnsListHybrid}, RANK () OVER (ORDER BY ts_rank_cd(to_tsvector('{this._textSearchLanguage}', {this._colContent}), query) DESC)
-                            FROM {tableName}, plainto_tsquery('{this._textSearchLanguage}', @query) query
-                            WHERE  {filterSqlHybridText} AND to_tsvector('{this._textSearchLanguage}', {this._colContent}) @@ query
-                            ORDER BY ts_rank_cd(to_tsvector('{this._textSearchLanguage}', {this._colContent}), query) DESC
-                            LIMIT @limit
-                        )
-                        SELECT
-                            {this._columnsListHybridCoalesce},
-                            COALESCE(1.0 / ({this._rrfK} + semantic_search.rank), 0.0) +
-                            COALESCE(1.0 / ({this._rrfK} + keyword_search.rank), 0.0) AS {colDistance}
-                        FROM semantic_search
-                        FULL OUTER JOIN keyword_search ON semantic_search.{this._colId} = keyword_search.{this._colId}
-                        ORDER BY {colDistance} DESC
-                        LIMIT @limit
-                        OFFSET @offset
-                    ";
-                        cmd.Parameters.AddWithValue("@query", query);
-                        cmd.Parameters.AddWithValue("@minSimilarity", minSimilarity);
+                            OFFSET @offset
+                        ";
                     }
                     else
                     {
                         // When using 1 - (embedding <=> target) the index is not being used, therefore we calculate
                         // the similarity (1 - distance) later. Furthermore, colDistance can't be used in the WHERE clause.
                         cmd.CommandText = @$"
-                            SELECT {columns}, {this._colEmbedding} <=> @embedding AS {colDistance}
+                            SELECT {string.Join(',', columns)}, {this._colEmbedding} <=> @embedding AS {colDistance}
                             FROM {tableName}
-                            WHERE {filterSql}
+                            WHERE {filterSql} AND {this._colEmbedding} <=> @embedding < @maxDistance
                             ORDER BY {colDistance} ASC
                             LIMIT @limit
                             OFFSET @offset
@@ -510,6 +589,7 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
                     cmd.Parameters.AddWithValue("@maxDistance", maxDistance);
                     cmd.Parameters.AddWithValue("@limit", limit);
                     cmd.Parameters.AddWithValue("@offset", offset);
+                    cmd.Parameters.AddWithValue("@query", query);
 
                     foreach (KeyValuePair<string, object> kv in sqlUserValues)
                     {
@@ -526,7 +606,7 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
                             while (await dataReader.ReadAsync(cancellationToken).ConfigureAwait(false))
                             {
                                 double distance = dataReader.GetDouble(dataReader.GetOrdinal(colDistance));
-                                double similarity = 1 - distance;
+                                double similarity = useHybridSearch ? distance : 1 - distance;
                                 result.Add((this.ReadEntry(dataReader, withEmbeddings), similarity));
                             }
                         }
@@ -575,7 +655,7 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
 
         if (limit <= 0) { limit = int.MaxValue; }
 
-        string columns = withEmbeddings ? this._columnsListWithEmbeddings : this._columnsListNoEmbeddings;
+        var columns = withEmbeddings ? this._columnsListWithEmbeddings : this._columnsListNoEmbeddings;
 
         // Filtering logic
         filterSql = filterSql?.Trim().Replace(PostgresSchema.PlaceholdersTags, this._colTags, StringComparison.Ordinal);
@@ -603,7 +683,7 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
                 {
 #pragma warning disable CA2100 // SQL reviewed
                     cmd.CommandText = @$"
-                        SELECT {columns} FROM {tableName}
+                        SELECT {string.Join(',', columns)} FROM {tableName}
                         WHERE {filterSql}
                         ORDER BY {orderBySql}
                         LIMIT @limit
@@ -733,12 +813,9 @@ internal sealed class PostgresDbClient : IDisposable, IAsyncDisposable
     private readonly string _colTags;
     private readonly string _colContent;
     private readonly string _colPayload;
-    private readonly string _columnsListNoEmbeddings;
-    private readonly string _columnsListWithEmbeddings;
-    private readonly string _columnsListHybrid;
-    private readonly string _columnsListHybridCoalesce;
+    private readonly List<string> _columnsListNoEmbeddings;
+    private readonly List<string> _columnsListWithEmbeddings;
     private readonly bool _dbNamePresent;
-    private readonly string _textSearchLanguage;
     private readonly int _rrfK;
 
     /// <summary>
